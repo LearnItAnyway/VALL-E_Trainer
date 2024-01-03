@@ -53,32 +53,68 @@ audio_tokenizer = AudioTokenizer(device)
 vocos = Vocos.from_pretrained('charactr/vocos-encodec-24khz').to(device)
 
 model.to(device)
+
+def split_text_into_chunks(text, max_words=20):
+    # Function to split text into sentences
+    def split_into_sentences(text):
+        sentences, sentence = [], []
+        for word in text.split():
+            sentence.append(word)
+            if word.endswith(('.','!','?')):
+                sentences.append(' '.join(sentence))
+                sentence = []
+        if sentence:
+            sentences.append(' '.join(sentence))
+        return sentences
+
+    # Function to split a sentence into chunks
+    def split_sentence_into_chunks(sentence, max_words):
+        words = sentence.split()
+        return [' '.join(words[i:i+max_words]) for i in range(0, len(words), max_words)]
+
+    # Split text into sentences and then into chunks
+    sentences = split_into_sentences(text)
+    chunks = []
+    for sentence in sentences:
+        chunks.extend(split_sentence_into_chunks(sentence, max_words))
+    return chunks
+
 @torch.no_grad()
 def infer_from_prompt(text_prompt, audio_prompt, text):
-    ## text to token
-    text_tokens, text_tokens_lens = text_collater(
-        [ text_tokenizer(f"{text_prompt} {text}".strip())]
-    )
-    _, enroll_x_lens = text_collater(
-        [ text_tokenizer(text=f"{text_prompt}".strip()) ]
-    )
-    print('text_loaded')
+    # Split text into chunks
+    text_chunks = split_text_into_chunks(text, max_words=20)
+    
+    combined_audio = None
+    for chunk in text_chunks:
+        # Process each chunk to generate audio
+        text_tokens, text_tokens_lens = text_collater(
+            [text_tokenizer(f"{text_prompt} {chunk}".strip())]
+        )
+        _, enroll_x_lens = text_collater(
+            [text_tokenizer(text=f"{text_prompt}".strip())]
+        )
 
-    # text to synthesize
-    wav_pr, sr = torchaudio.load(audio_prompt)
-    wav_pr = convert_audio(wav_pr, sr, audio_tokenizer.sample_rate, audio_tokenizer.channels)
-    audio_prompts = audio_tokenizer.encode(wav_pr.unsqueeze(0))[0][0].transpose(2, 1).to(device)
+        wav_pr, sr = torchaudio.load(audio_prompt)
+        wav_pr = convert_audio(wav_pr, sr, audio_tokenizer.sample_rate, audio_tokenizer.channels)
+        audio_prompts = audio_tokenizer.encode(wav_pr.unsqueeze(0))[0][0].transpose(2, 1).to(device)
 
-    print('Audio encoded')
+        encoded_frames = model.inference(
+            text_tokens.to(device), text_tokens_lens.to(device),
+            audio_prompts, enroll_x_lens=enroll_x_lens,
+            top_k=-100, temperature=1)
+        vocos_features = vocos.codes_to_features(encoded_frames.permute(2, 0, 1))
+        samples = vocos.decode(vocos_features, bandwidth_id=torch.tensor([2], device=device))
 
-    encoded_frames = model.inference(
-        text_tokens.to(device), text_tokens_lens.to(device),
-        audio_prompts, enroll_x_lens=enroll_x_lens,
-        top_k=-100, temperature=1)
-    vocos_features = vocos.codes_to_features(encoded_frames.permute(2, 0, 1))
-    samples = vocos.decode(vocos_features, bandwidth_id=torch.tensor([2], device=device))
-    message = f"sythesized text: {text}"
-    return message, (24000, samples.squeeze(0).cpu().numpy())
+        # Concatenate the audio
+        if combined_audio is None:
+            combined_audio = samples
+        else:
+            combined_audio = torch.cat((combined_audio, samples), dim=1)
+
+    message = f"Sythesized text: {text}"
+    return message, (24000, combined_audio.squeeze(0).cpu().numpy())
+
+# Rest of the code remains the same
 
 
 app = gr.Blocks(title="VALL-E Demo")
